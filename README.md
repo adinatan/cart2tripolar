@@ -12,3 +12,5 @@
   The code was originally used in the context of analyzing images with 
  symmetry around a quadrant so that functionality was kept. 
  The code support NaN valued pixels for masking.
+
+See tripol_der.pdf for more details.
