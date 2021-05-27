@@ -14,3 +14,5 @@
  The code support NaN valued pixels for masking.
 
 See tripol_der.pdf for more details.
+
+  ![Fig1](https://github.com/adinatan/cart2tripolar/blob/master/fig2.png)
