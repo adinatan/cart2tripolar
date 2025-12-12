@@ -1,4 +1,4 @@
-function [ira_tot , varargout]=cart2tripolar(im, qParams)
+function [ira, varargout] = cart2tripolar(im, qParams, opts)
 % Cartesian to polar pixel transform - with compact representation
 % The code starts with a Cartesian image of square pixel size dx*dy=1, and
 % outputs a polar image of polar pixels that has a similar amount of
@@ -7,37 +7,31 @@ function [ira_tot , varargout]=cart2tripolar(im, qParams)
 % Cartesian pixels. The result is a triangular polar representation,
 % because the number of polar pixels per radius per angle increase with
 % radius, i.e. the larger the radius the higher the angular resolution.
-% The code was originally used in the context of analyzing images with 
-% symmetry around a quadrant so that functionality was kept. 
+% The code was originally used in the context of analyzing images with
+% symmetry around a quadrant so that functionality was kept.
 % The code support NaN valued pixels for masking.
 %
 % Inputs:
-%  im       - an image, assumed to be centered and corrected for deformations, tilt, etc.
-%             the image may contain NaN, and the function will ignore them.
-%  qParams  - (optional) a vector that states the quadrants of the image to include
-%             in the analysis, e.g. [2 3] will treat only the left side
-%             of the image. When im is plotted using imagesc(im) then
-%             qParams=1 is top right
-%             qParams=2 is top left
-%             qParams=3 is bottom left
-%             qParams=4 is bottom right
+%   im      : 2D image (double/float ok), may contain NaN mask
+%   qParams : subset of 1:4 (default 1:4)
+%   opts    : struct with fields:
+%       .include_corners (true/false)  default true
+%       .method          'integrate' (default) or 'sample'
+%       .Nr              radial quad order  (default 3)
+%       .Nt              angular quad order (default 3)
+%       .interp          'linear' (default) or 'nearest'
 %
-% Optional Outputs:
-%
-% ira      - Intensity per Radius per Angle - a 2d triangular array in
-%            polar coordinates of each im quadrant (pi/2 angle spread),
-%            where the quadrants are represented in the 3 dimension (as 
-%            pages). Area outside the triangular array is set to NaN.
-% ira_tot  -  Same as ira but of the entire image that is included (up to
-%            0 to 2*pi)
-% spol     - taking ira_tot and stretching it to a standard 2d square array
-%             using linear interpolation.
-%
+% Outputs:
+%   ira     : [L x (max(PPR)+1) x 4] triangular polar per quadrant
+%   ira_tot : stitched triangular for qParams (optional)
+%   spol    : squared polar (optional)
+%   area    : area per polar pixel (optional 4th output)
+
 %
 % Example:
 %------------
 % load('testimg.mat');
-% [ira_tot ira spol]=cart2tripolar(im);
+% [ira ira_tot spol]=cart2tripolar(im);
 % figure(2);
 % for n=1:4
 %     subplot(2,2,n); imagesc(ira(:,:,n));  title(['ira - quadrant # ' num2str(n) ]);
@@ -50,158 +44,233 @@ function [ira_tot , varargout]=cart2tripolar(im, qParams)
 %
 % __________________________________
 %   Adi Natan (natan@stanford.edu)
-%   Ver 1.01 , Date: Dec 6th 2017
+%   Ver 1.2 , Date: Dec 12th 2025
 
 
-
-%% Deafults
-if (nargin < 2)
-    qParams=1:4; % include all image quadrants unless stated otherwise.
+%% defaults
+if nargin < 1 || isempty(im)
+    try, load('tim.mat'); catch, im = peaks(127); end
 end
-
-if (nargin < 1) % demo mode
-    qParams=1:4; % include all image quadrants unless stated otherwise.
-    try load('tim.mat'); catch; im=peaks(127); end
+if nargin < 2 || isempty(qParams)
+    qParams = 1:4;
 end
+if nargin < 3, opts = struct; end
 
-im=double(im);
+opts = setDefault(opts, 'include_corners', true);
+opts = setDefault(opts, 'method', 'integrate');   % 'integrate' or 'sample'
+opts = setDefault(opts, 'Nr', 3);                 % quadrature order in r
+opts = setDefault(opts, 'Nt', 3);                 % quadrature order in theta
+opts = setDefault(opts, 'interp', 'linear');      % 'linear' or 'nearest'
 
-%% set geometry parameters
-x0=ceil(size(im,1)/2); y0=ceil(size(im,2)/2); % Assuming image is centered
-L = min([x0,y0]); % Length of polar image (maximal radius)
-RR=(0:L);
-PPR=(floor(0.5*pi*(RR+1))-1); % the # of pixels per radius for cartesian quadrant
-AngleInc = (0.5*pi./PPR'); % the angle increment per radius
-AngleInc(1)=0; % avoid inf at origin
-%% create image quadrants
-if mod(size(im,1),2)==1 %case for odd image size
-    Q(:,:,1) =  im(x0:-1:x0-L+1,y0:y0+L-1);
-    Q(:,:,2) =  im(x0:-1:x0-L+1,y0:-1:y0-L+1);
-    Q(:,:,3) =  im(x0:x0+L-1   ,y0:-1:y0-L+1);
-    Q(:,:,4) =  im(x0:x0+L-1   ,y0:y0+L-1);
-else %case for even image size
-    Q(:,:,1) =  im(x0:-1:x0-L+1,y0+1:y0+L);
-    Q(:,:,2) =  im(x0:-1:x0-L+1,y0:-1:y0-L+1);
-    Q(:,:,3) =  im(x0+1:x0+L   ,y0:-1:y0-L+1);
-    Q(:,:,4) =  im(x0+1:x0+L   ,y0+1:y0+L);
-end
+qParams = qParams(:).';
+assert(all(ismember(qParams,1:4)), 'qParams must be subset of 1:4');
+im = double(im);
 
-%%
-ira = NaN(L-2,PPR(L),numel(qParams)); % initialize the  matrix
-
-for a4n=qParams % treat each quadrant seperatly
-    a4=Q(:,:,a4n);
-    ira(1,1,a4n) = a4(1,1);      % origin pixel remains the same
-    
-    for r=2:L-2
-        npr=PPR(r); % determine # polar pix in radius
-        angincr=AngleInc(r);    % the angular increment per radius
-        qp=0:npr;
-        xp=r*sin(angincr*qp)+1;  % polar x-coordinate
-        yp=r*cos(angincr*qp)+1;  % polar y-coordinate
-        
-        % the signal in a polar pixel at (r,qp) is determined by its
-        %  fractional overlap with the four surrounding Cartesian pixels
-        %  define scale fractional weight of cartesian pixels in polar pixels
-        xc=round(xp);
-        yc=round(yp);
-        xd=1-abs(xc-xp);
-        yd=1-abs(yc-yp);
-        
-        
-        a4r=[ (a4(xc+(yc-1)*L));
-            0 (a4(xc(2:npr)+(yc(2:npr)-1+(-1).^(yp(2:npr)<yc(2:npr)))*L)) 0;
-            0 (a4(xc(2:npr)+(-1).^(xp(2:npr)<xc(2:npr))+yc(2:npr)*L)) 0;
-            0 (a4(xc(2:npr)+(-1).^(xp(2:npr)<xc(2:npr))+L*(yc(2:npr)+(-1).^(yp(2:npr)<yc(2:npr))))) 0];
-        
-        c=[xd.*yd;
-            0 xd(2:npr).*(1-yd(2:npr)) 0;
-            0 (1-xd(2:npr)).*yd(2:npr) 0;
-            0 (1-xd(2:npr)).*(1-yd(2:npr)) 0];
-        
-        % only when all 4 cartesian pixels are NaN the polar pixel will be NaN
-        % otherwise, only the not NaN values will be considered according
-        % to their fractional contribution
-        
-        c=bsxfun(@rdivide,c.*(~isnan(a4r)),sum(c.*(~isnan(a4r))));
-        
-        % gather intensity per radius per angle (ira)
-        ira(r,1:npr+1,a4n) = nansum(c.*a4r);
-        ira(r,all(isnan(c.*a4r)),a4n)=NaN;
+%% geometry / padding
+if opts.include_corners
+    ims = size(im);
+    if ims(1) > ims(2)
+        im(:, end+1:ims(1)) = NaN;
+    elseif ims(1) < ims(2)
+        im(end+1:ims(2), :) = NaN;
     end
+    im = padarray(im, ceil(size(im)*(sqrt(2)-1)/2), NaN);
 end
 
-%% outputs
-%  add all quadrants to one triangular array
-%  (internal function)
-ira_tot=addquad(ira,qParams);
+nx = size(im,1); ny = size(im,2);
+x0 = floor((nx+1)/2);
+y0 = floor((ny+1)/2);
+L  = min([x0, y0, nx-x0+1, ny-y0+1]);   % quadrant size
 
-% return ira and spol if asked for
-nout = max(nargout,1) - 1;
-if nout
-    varargout{1} = ira;
-    % tri-polar to square polar transform
-    spol=t2s(ira,qParams);
-    varargout{2} = spol;
-end
+% radius centers in "pixel-center" units: rc = r-1
+rc = 0:(L-1);
 
-if (nargin < 1) % demo mode
- figure(1);
- for n=1:4
-     subplot(2,2,n); imagesc(ira(:,:,n));  title(['ira - quadrant # ' num2str(n) ]);
- end
+% improved angular bin rule: want arc length ~ 1 at mid-radius (rc+0.5)
+% arc ≈ (rc+0.5)*dtheta => choose ntheta ≈ (pi/2)*(rc+0.5)
+PPR = max(1, round( (pi/2) * (rc + 0.5) ));     % number of angular bins per quadrant
+AngleInc = (0.5*pi) ./ PPR(:);
+AngleInc(1) = 0;
 
- figure('Position',[50 50 950 260]);
- subplot(1,3,1); imagesc(im); axis square; title('Img');
- subplot(1,3,2); imagesc(ira_tot); axis square; title('ira__tot');
- subplot(1,3,3); imagesc([0 2*pi],1:size(ira,1),t2s(ira,qParams)); axis square; title('spol'); xlabel('[rad]');
-end
+%% build quadrants (each LxL), with (1,1)=origin pixel
+Q = NaN(L,L,4);
+Q(:,:,1) = im(x0:-1:x0-L+1, y0:y0+L-1);
+Q(:,:,2) = im(x0:-1:x0-L+1, y0:-1:y0-L+1);
+Q(:,:,3) = im(x0:x0+L-1   , y0:-1:y0-L+1);
+Q(:,:,4) = im(x0:x0+L-1   , y0:y0+L-1);
 
-function ira_tot=addquad(ira,qParams)
-% something is buggy here with 0 replacing NaN - check and fix!
-% add all quadrants to one array keeping consistent directionality
-[Ms,~] = size(ira);
-PPR=(floor(0.5*pi*((0:Ms)+1))-1); % calc the  # of pixels per radius in quadrant
-ira_tot=NaN(size(ira,1), numel(qParams)*size(ira,2)); % preallocate
+%% allocate
+maxCols = max(PPR) + 1;               % +1 because we keep qp=0:npr edges
+ira  = NaN(L, maxCols, 4);
+area = NaN(L, maxCols, 4);
 
-for r=Ms:-1:2
-    npr=PPR(r)+1;
-    clear irav
-    for a4n=qParams % treat each quadrant seperatly
-        if mod(a4n,2)==1 %case for odd quadrant #
-            irav(:,a4n)=ira(r,1:npr,a4n);
-        else %case for even quadrant #
-            irav(:,a4n)=ira(r,npr:-1:1,a4n);
+% quadrature nodes/weights on [-1,1]
+[xr, wr] = gaussLegendre(opts.Nr);
+[xt, wt] = gaussLegendre(opts.Nt);
+
+for a4n = qParams
+    a4 = Q(:,:,a4n);
+
+    % interpolant for integration / sampling
+    F = griddedInterpolant({1:L, 1:L}, a4, opts.interp, 'none');
+
+    ira(1,1,a4n)  = a4(1,1);
+    area(1,1,a4n) = 1;  % arbitrary for origin; not used
+
+    for r = 2:L
+        ntheta = PPR(r);            % number of bins
+        dtheta = AngleInc(r);
+
+        % radial pixel footprint in r-units (centered at rc=r-1)
+        r1 = (r-1) - 0.5;
+        r2 = (r-1) + 0.5;
+        if r1 < 0, r1 = 0; end
+
+        for k = 1:(ntheta+1)
+            % keep qp=0..ntheta (edges included, matches your original)
+            % define theta "pixel" around that sample index:
+            % for interior points, cell is centered; for endpoints, clamp.
+            if k == 1
+                t1 = 0;
+                t2 = 0.5*dtheta;
+            elseif k == ntheta+1
+                t1 = 0.5*pi - 0.5*dtheta;
+                t2 = 0.5*pi;
+            else
+                tc = (k-1)*dtheta;
+                t1 = tc - 0.5*dtheta;
+                t2 = tc + 0.5*dtheta;
+            end
+
+            if strcmpi(opts.method,'integrate')
+                % --- area-consistent quadrature over [r1,r2]x[t1,t2] with Jacobian r ---
+                % map quad nodes from [-1,1] -> [a,b]
+                rr = 0.5*(r2-r1)*xr + 0.5*(r2+r1);    % Nr x 1
+                tt = 0.5*(t2-t1)*xt + 0.5*(t2+t1);    % Nt x 1
+
+                % tensor grid
+                [RR, TT] = ndgrid(rr, tt);
+
+                % quadrant coords (1-based)
+                X = RR .* sin(TT) + 1;    % row coordinate
+                Y = RR .* cos(TT) + 1;    % col coordinate
+
+                V = F(X, Y);              % may contain NaN
+
+                % weights include Jacobian r and interval scaling
+                W = (0.5*(r2-r1)*wr) * (0.5*(t2-t1)*wt).';  % Nr x Nt (outer product)
+                W = W .* RR;                                   % Jacobian
+
+                mask = ~isnan(V);
+                sw = sum(W(mask));
+                if sw > 0
+                    ira(r,k,a4n) = sum(W(mask).*V(mask)) / sw; % area-weighted average
+                else
+                    ira(r,k,a4n) = NaN;
+                end
+
+                % analytic area of polar cell (for reference / conservation checks)
+                area(r,k,a4n) = 0.5*(r2^2 - r1^2) * (t2 - t1);
+
+            else
+                % --- fast sampling fallback (not as accurate as integrate) ---
+                tc = (k-1)*dtheta;
+                xp = (r-1)*sin(tc) + 1;
+                yp = (r-1)*cos(tc) + 1;
+                ira(r,k,a4n) = F(xp, yp);
+                area(r,k,a4n) = 0.5*(r2^2 - r1^2) * min(dtheta, (t2-t1));
+            end
         end
     end
-    ira_tot(r,1:npr*numel(qParams))=reshape(irav(:,qParams),1,[]);
 end
-ira_tot(1,1)=mean(ira(1,1,qParams),3);
 
+%% optional outputs
+if nargout > 1
+    ira_tot = addquad_fixed(ira, qParams, PPR);
+    varargout{1} = ira_tot;
 
-function squmat=t2s(ira,qParams)
-% transfer from triangular polar matrix to square polar matrix
-PPR=(floor(0.5*pi*((0:size(ira,1))+1))-1); % calc the  # of pixels per radius in quadrant
-%qParams=find(squeeze(~all(all(isnan(ira)))));
-totPPR = numel(qParams)*(PPR+1); % total # of polar pixels per radius considering qParams
-
-ira_tot=addquad(ira,qParams); % get the ira_tot
-
-% create a matrix that "squares" the triangular polar matrix
-squmat=zeros(size(ira_tot)); % preallocate
-% the first pixel is just the intensity at the origin
-squmat(1,:)=ones(1,size(ira_tot,2)).*ira_tot(1,1);
-for k=2:size(ira_tot,1)
-    try % in case data is all zero, then interp1 wont work
-       
-        
-        %first map pixels in given range to new range
-        smap=interp1(1:totPPR(k) , single(~isnan(ira_tot(k,1:totPPR(k)))) , linspace(1,totPPR(k),size(ira_tot,2)) ,'nearest');
-        % interp only on non NaN pixels
-        nr=~isnan(ira_tot(k,1:totPPR(k))); 
-        squmat(k,:)=interp1(find(nr),ira_tot(k,nr),linspace(1,totPPR(k),size(ira_tot,2)),'nearest');
-        squmat(k,~smap)=NaN;
-       
-    catch
+    if nargout > 2
+        spol = t2s_fixed(ira_tot, qParams, PPR);
+        varargout{2} = spol;
     end
+    if nargout > 3
+        varargout{3} = area;
+    end
+end
+
+end
+
+%% helpers
+
+function S = setDefault(S, name, val)
+if ~isfield(S,name) || isempty(S.(name))
+    S.(name) = val;
+end
+end
+
+function [x,w] = gaussLegendre(n)
+% Gauss-Legendre nodes/weights on [-1,1], n<=8 typical. Hardcode for stability.
+switch n
+    case 1
+        x = 0; w = 2;
+    case 2
+        x = [-1 1]'/sqrt(3); w = [1 1]';
+    case 3
+        x = [-sqrt(3/5) 0 sqrt(3/5)]';
+        w = [5/9 8/9 5/9]';
+    case 4
+        x = [-0.8611363116 -0.3399810436 0.3399810436 0.8611363116]';
+        w = [0.3478548451 0.6521451549 0.6521451549 0.3478548451]';
+    case 5
+        x = [-0.9061798459 -0.5384693101 0 0.5384693101 0.9061798459]';
+        w = [0.2369268851 0.4786286705 0.5688888889 0.4786286705 0.2369268851]';
+    otherwise
+        % fallback: use 3 as a reasonable default
+        x = [-sqrt(3/5) 0 sqrt(3/5)]';
+        w = [5/9 8/9 5/9]';
+end
+end
+
+function ira_tot = addquad_fixed(ira, qParams, PPR)
+Ms = size(ira,1);
+nQ = numel(qParams);
+ira_tot = NaN(Ms, nQ*(max(PPR)+1));
+
+for r = 2:Ms
+    npr = PPR(r) + 1;
+    irav = NaN(npr, nQ);
+
+    for k = 1:nQ
+        a4n = qParams(k);
+        row = ira(r,1:npr,a4n);
+        if mod(a4n,2)==0
+            row = row(end:-1:1);
+        end
+        irav(:,k) = row(:);
+    end
+    ira_tot(r, 1:npr*nQ) = reshape(irav, 1, []);
+end
+
+ira_tot(1,1) = mean(ira(1,1,qParams), 3, 'omitnan');
+end
+
+function squmat = t2s_fixed(ira_tot, qParams, PPR)
+Ms = size(ira_tot,1);
+nQ = numel(qParams);
+W  = size(ira_tot,2);
+
+squmat = NaN(Ms, W);
+squmat(1,:) = ira_tot(1,1);
+
+for r = 2:Ms
+    npr = (PPR(r)+1) * nQ;
+    row = ira_tot(r, 1:npr);
+
+    if all(isnan(row)), continue; end
+
+    xi  = linspace(1, npr, W);
+    idx = max(1, min(npr, round(xi)));
+
+    squmat(r,:) = row(idx);
+    squmat(r, isnan(row(idx))) = NaN;
+end
 end
